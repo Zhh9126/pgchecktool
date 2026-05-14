@@ -1,0 +1,2366 @@
+#!/usr/bin/env python3
+# -*- coding:utf-8 -*-
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+import sys
+import os
+import psycopg2
+from psycopg2 import OperationalError, DatabaseError
+import argparse
+import subprocess
+import logging
+import platform
+from datetime import datetime
+from pathlib import Path
+import configparser
+import json
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+import base64
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+# 导入许可证管理器
+try:
+    from license_manager import LicenseValidator
+    HAS_LICENSE = True
+except ImportError:
+    HAS_LICENSE = False
+
+# 修复docx打包问题
+def fix_docx_template_path():
+    """修复docx库模板路径问题"""
+    try:
+        if getattr(sys, 'frozen', False):
+            base_path = os.path.dirname(sys.executable)
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        
+        docx_template_dir = os.path.join(base_path, 'docx_templates')
+        os.makedirs(docx_template_dir, exist_ok=True)
+        
+        return True
+    except:
+        return False
+
+# 初始化修复
+fix_docx_template_path()
+
+try:
+    import docx
+    from docx.shared import Cm, Inches, Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
+try:
+    import openpyxl
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    HAS_EXCEL = True
+except ImportError:
+    HAS_EXCEL = False
+
+# 密码加密管理器 - 修复版本
+class PasswordEncryptor:
+    """密码加密管理器"""
+    
+    def __init__(self, master_key=None):
+        """初始化加密器"""
+        self.master_key = master_key or self._get_default_master_key()
+        self.fernet = self._create_fernet(self.master_key)
+    
+    def _get_default_master_key(self):
+        """获取默认主密钥（基于机器特征）"""
+        try:
+            # 使用机器特征生成基础密钥
+            machine_id = platform.node()  # 主机名
+            system_info = platform.system() + platform.release()
+            base_key = f"{machine_id}_{system_info}_pg_inspector_v3"
+            
+            # 使用PBKDF2派生密钥
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=b'pg_inspector_salt',
+                iterations=100000,
+            )
+            key = base64.urlsafe_b64encode(kdf.derive(base_key.encode()))
+            return key
+        except:
+            # 备用方案：固定密钥（安全性较低，但保证可用性）
+            return Fernet.generate_key()
+    
+    def _create_fernet(self, key):
+        """创建Fernet加密器"""
+        try:
+            return Fernet(key)
+        except:
+            # 如果密钥格式错误，生成新密钥
+            new_key = Fernet.generate_key()
+            return Fernet(new_key)
+    
+    def encrypt_password(self, password):
+        """加密密码 - 修复版本，处理特殊字符"""
+        if not password:
+            return ""
+        try:
+            # 确保密码是字符串
+            password_str = str(password)
+            
+            # 使用base64编码处理特殊字符
+            password_bytes = password_str.encode('utf-8')
+            encrypted = self.fernet.encrypt(password_bytes)
+            
+            # 使用URL安全的base64编码
+            encrypted_str = base64.urlsafe_b64encode(encrypted).decode('utf-8')
+            return encrypted_str
+            
+        except Exception as e:
+            print(f"加密密码时出错: {e}")
+            return str(password)  # 加密失败时返回原文
+    
+    def decrypt_password(self, encrypted_password):
+        """解密密码 - 修复版本，处理特殊字符"""
+        if not encrypted_password:
+            return ""
+        
+        # 确保输入是字符串
+        encrypted_str = str(encrypted_password)
+        
+        # 检查是否是加密格式（base64特征）
+        try:
+            # 首先尝试直接解密（可能是加密格式）
+            encrypted_bytes = base64.urlsafe_b64decode(encrypted_str.encode('utf-8'))
+            decrypted = self.fernet.decrypt(encrypted_bytes)
+            return decrypted.decode('utf-8')
+        except Exception as e:
+            # 如果解密失败，返回原文（可能是明文）
+            print(f"解密密码时出错: {e}")
+            return encrypted_str
+    
+    def test_encryption(self, password):
+        """测试加密和解密过程"""
+        print(f"原始密码: {password}")
+        encrypted = self.encrypt_password(password)
+        print(f"加密后: {encrypted}")
+        decrypted = self.decrypt_password(encrypted)
+        print(f"解密后: {decrypted}")
+        print(f"匹配: {password == decrypted}")
+        return password == decrypted
+
+# 控制台输出美化
+class ConsolePrinter:
+    @staticmethod
+    def print_separator():
+        print("=" * 80)
+    
+    @staticmethod
+    def print_title(title):
+        ConsolePrinter.print_separator()
+        print(f"🎯 {title}")
+        ConsolePrinter.print_separator()
+    
+    @staticmethod
+    def print_success(msg):
+        print(f"✅ {msg}")
+    
+    @staticmethod
+    def print_info(msg):
+        print(f"ℹ️  {msg}")
+    
+    @staticmethod
+    def print_warning(msg):
+        print(f"⚠️  {msg}")
+    
+    @staticmethod
+    def print_error(msg):
+        print(f"❌ {msg}")
+    
+    @staticmethod
+    def print_progress(current, total, prefix="", suffix="", length=50):
+        percent = 100 * (current / float(total))
+        filled_length = int(length * current // total)
+        bar = "█" * filled_length + "▒" * (length - filled_length)
+        print(f"\r{prefix} {current}/{total} |{bar}| {percent:.1f}% {suffix}", end="", flush=True)
+        if current >= total:
+            print()
+
+# 修复后的许可证管理器包装类
+class LicenseManager:
+    def __init__(self):
+        self.validator = None
+        self.license_info = None
+        self.license_checked = False  # 添加标志位，确保只显示一次
+    
+    def init_license(self):
+        """初始化许可证系统"""
+        if not HAS_LICENSE:
+            self.license_info = {
+                "is_valid": True,
+                "message": "试用模式",
+                "remaining_days": 999,
+                "license_type": "TRIAL"
+            }
+            return True
+        
+        try:
+            self.validator = LicenseValidator()
+            self.license_info = self.validator.get_license_info()
+            
+            if not self.license_info["is_valid"]:
+                ConsolePrinter.print_error("许可证验证失败")
+                return False
+            else:
+                # 只在第一次初始化时显示许可证信息
+                if not self.license_checked:
+                    license_type = self.license_info.get('license_type', 'UNKNOWN')
+                    if license_type == "PERMANENT":
+                        ConsolePrinter.print_success("永久许可证验证成功")
+                    else:
+                        remaining_days = self.license_info.get('remaining_days', 0)
+                        ConsolePrinter.print_success(f"试用许可证验证成功，剩余 {remaining_days} 天")
+                    self.license_checked = True
+                return True
+                
+        except Exception:
+            ConsolePrinter.print_error("许可证初始化失败")
+            return False
+    
+    def check_license(self):
+        """检查许可证有效性 - 修复版本"""
+        if not HAS_LICENSE:
+            return True  # 无许可证管理器时允许运行
+        
+        if not self.validator:
+            return False
+        
+        try:
+            # 修复：正确处理validate_license返回的4个值
+            validation_result = self.validator.validate_license()
+            
+            # 检查返回值的类型和长度
+            if isinstance(validation_result, tuple) and len(validation_result) == 4:
+                is_valid, message, remaining_days, license_type = validation_result
+            elif isinstance(validation_result, tuple) and len(validation_result) == 3:
+                # 兼容旧版本返回3个值的情况
+                is_valid, message, remaining_days = validation_result
+                license_type = "UNKNOWN"
+            else:
+                # 如果返回值格式不符合预期，视为无效
+                return False
+            
+            if not is_valid:
+                ConsolePrinter.print_error("许可证无效")
+                return False
+            return True
+            
+        except Exception:
+            ConsolePrinter.print_error("许可证检查失败")
+            return False
+    
+    def get_license_status(self):
+        """获取许可证状态"""
+        return self.license_info
+    
+    def show_license_info(self):
+        """显示许可证信息"""
+        if self.license_info:
+            ConsolePrinter.print_title("许可证信息")
+            print(f"📄 状态: {'✅ 有效' if self.license_info['is_valid'] else '❌ 无效'}")
+            print(f"📝 信息: {self.license_info['message']}")
+            print(f"📅 剩余天数: {self.license_info['remaining_days']}")
+            print(f"🔐 许可证类型: {self.license_info.get('license_type', '未知')}")
+        else:
+            ConsolePrinter.print_warning("未找到许可证信息")
+
+# 连接测试器类
+class ConnectionTester:
+    """数据库连接测试器"""
+    
+    def __init__(self, encryptor):
+        self.encryptor = encryptor
+    
+    def test_postgresql_connection(self, db_info):
+        """测试PostgreSQL连接"""
+        ConsolePrinter.print_info(f"测试连接 {db_info['host']}:{db_info.get('port', 5432)}/{db_info['database']}")
+        
+        # 创建副本并解密密码
+        db_info_copy = db_info.copy()
+        
+        if 'password' in db_info_copy and db_info_copy['password']:
+            original_password = db_info_copy['password']
+            if self._is_encrypted_format(original_password):
+                db_info_copy['password'] = self.encryptor.decrypt_password(original_password)
+                ConsolePrinter.print_info("数据库密码已解密")
+        
+        try:
+            conn_params = {
+                'host': db_info_copy.get('host', 'localhost'),
+                'port': db_info_copy.get('port', 5432),
+                'database': db_info_copy.get('database', 'postgres'),
+                'user': db_info_copy.get('user', 'postgres'),
+                'password': db_info_copy.get('password', ''),
+                'connect_timeout': 10
+            }
+            
+            connection = psycopg2.connect(**conn_params)
+            cursor = connection.cursor()
+            
+            # 执行简单查询验证连接
+            cursor.execute("SELECT version();")
+            version = cursor.fetchone()[0]
+            
+            cursor.close()
+            connection.close()
+            
+            ConsolePrinter.print_success("数据库连接测试成功")
+            ConsolePrinter.print_info(f"数据库版本: {version.split(',')[0]}")
+            return True
+            
+        except OperationalError as e:
+            ConsolePrinter.print_error(f"数据库连接失败: {e}")
+            return False
+        except Exception as e:
+            ConsolePrinter.print_error(f"连接测试错误: {e}")
+            return False
+    
+    def test_ssh_connection(self, host_info):
+        """测试SSH连接"""
+        try:
+            import paramiko
+        except ImportError:
+            ConsolePrinter.print_error("未安装paramiko，无法测试SSH连接")
+            return False
+        
+        ConsolePrinter.print_info(f"测试SSH连接 {host_info['host']}:{host_info.get('ssh_port', 22)}")
+        
+        # 解密SSH密码
+        ssh_password = host_info.get('ssh_password', '')
+        if ssh_password and self._is_encrypted_format(ssh_password):
+            ssh_password = self.encryptor.decrypt_password(ssh_password)
+            ConsolePrinter.print_info("SSH密码已解密")
+        
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            ssh.connect(
+                hostname=host_info['host'],
+                port=host_info.get('ssh_port', 22),
+                username=host_info.get('ssh_user'),
+                password=ssh_password,
+                timeout=10,
+                allow_agent=False,
+                look_for_keys=False
+            )
+            
+            # 执行简单命令验证连接
+            stdin, stdout, stderr = ssh.exec_command('echo "SSH连接测试成功"', timeout=5)
+            output = stdout.read().decode().strip()
+            
+            ssh.close()
+            
+            ConsolePrinter.print_success("SSH连接测试成功")
+            return True
+            
+        except Exception as e:
+            ConsolePrinter.print_error(f"SSH连接失败: {e}")
+            return False
+    
+    def _is_encrypted_format(self, password):
+        """判断密码是否是加密格式"""
+        password_str = str(password)
+        try:
+            # 检查是否是base64格式（加密后的特征）
+            if len(password_str) > 50 and re.match(r'^[A-Za-z0-9-_]*={0,2}$', password_str):
+                return True
+            return False
+        except:
+            return False
+
+# SSH远程主机检查类 - 修复版本
+class SSHHostChecker:
+    """通过SSH检查远程主机系统资源"""
+    
+    def __init__(self, host_info, encryptor):
+        self.host_info = host_info
+        self.encryptor = encryptor
+    
+    def check_via_ssh(self):
+        """通过SSH检查远程主机 - 修复版本"""
+        try:
+            import paramiko
+        except ImportError:
+            ConsolePrinter.print_error("未安装paramiko，无法执行SSH远程检查")
+            ConsolePrinter.print_info("请使用命令安装: pip install paramiko")
+            return None
+        
+        try:
+            # 建立SSH连接
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            ConsolePrinter.print_info(f"正在连接远程主机 {self.host_info['host']}...")
+            
+            # 重要修复：确保密码已解密
+            ssh_password = self.host_info.get('ssh_password', '')
+            
+            # 如果密码可能是加密的，尝试解密
+            if ssh_password and self._is_encrypted_format(ssh_password):
+                ssh_password = self.encryptor.decrypt_password(ssh_password)
+                ConsolePrinter.print_info("SSH密码已自动解密")
+            
+            ssh.connect(
+                hostname=self.host_info['host'],
+                port=self.host_info.get('ssh_port', 22),
+                username=self.host_info.get('ssh_user'),
+                password=ssh_password,  # 使用可能解密后的密码
+                timeout=15,
+                allow_agent=False,
+                look_for_keys=False
+            )
+            
+            results = {}
+            
+            # 执行系统命令检查
+            commands = {
+                "系统信息": "hostnamectl 2>/dev/null || uname -a",
+                "CPU信息": "lscpu | grep -E 'Architecture|Model name|CPU\\(s\\)|Thread|MHz'; echo '---'; uptime",
+                "内存信息": "free -h",
+                "磁盘信息": "df -h | grep -E '^/dev/' | head -10"
+            }
+            
+            for check_name, command in commands.items():
+                try:
+                    stdin, stdout, stderr = ssh.exec_command(command, timeout=10)
+                    output = stdout.read().decode('utf-8').strip()
+                    error = stderr.read().decode('utf-8').strip()
+                    
+                    if error and not output:
+                        results[check_name] = {"columns": ["检查项", "状态", "错误信息"], 
+                                             "data": [[check_name, "失败", error]]}
+                    else:
+                        # 解析输出并格式化
+                        parsed_data = self._parse_ssh_output(check_name, output)
+                        results[check_name] = parsed_data
+                        
+                except Exception as e:
+                    results[check_name] = {"columns": ["检查项", "状态", "错误信息"], 
+                                         "data": [[check_name, "失败", str(e)]]}
+            
+            ssh.close()
+            ConsolePrinter.print_success(f"SSH主机检查完成: {self.host_info['host']}")
+            return results
+            
+        except Exception as e:
+            ConsolePrinter.print_error(f"SSH连接失败: {e}")
+            return None
+    
+    def _is_encrypted_format(self, password):
+        """判断密码是否是加密格式"""
+        password_str = str(password)
+        # 检查是否是base64格式（加密后的特征）
+        try:
+            if len(password_str) > 50 and re.match(r'^[A-Za-z0-9-_]*={0,2}$', password_str):
+                return True
+            return False
+        except:
+            return False
+    
+    def _parse_ssh_output(self, check_name, output):
+        """解析SSH命令输出并格式化为表格数据"""
+        if check_name == "系统信息":
+            return self._parse_system_info(output)
+        elif check_name == "CPU信息":
+            return self._parse_cpu_info(output)
+        elif check_name == "内存信息":
+            return self._parse_memory_info(output)
+        elif check_name == "磁盘信息":
+            return self._parse_disk_info(output)
+        else:
+            # 默认处理：每行作为一个数据项
+            lines = output.split('\n')
+            data = []
+            for line in lines:
+                if line.strip():
+                    data.append([line])
+            return {"columns": ["信息"], "data": data}
+    
+    def _parse_system_info(self, output):
+        """解析系统信息"""
+        lines = output.split('\n')
+        data = []
+        
+        for line in lines:
+            if ':' in line:
+                key, value = line.split(':', 1)
+                data.append([key.strip(), value.strip()])
+            elif line.strip() and not line.startswith('---'):
+                data.append(["系统信息", line.strip()])
+        
+        return {"columns": ["项目", "值"], "data": data}
+    
+    def _parse_cpu_info(self, output):
+        """解析CPU信息"""
+        lines = output.split('\n')
+        data = []
+        
+        cpu_info = {}
+        load_info = ""
+        
+        for line in lines:
+            if ':' in line:
+                key, value = line.split(':', 1)
+                cpu_info[key.strip()] = value.strip()
+            elif 'load average:' in line:
+                load_info = line.strip()
+        
+        # 添加CPU信息
+        if 'Architecture' in cpu_info:
+            data.append(["架构", cpu_info['Architecture']])
+        if 'Model name' in cpu_info:
+            data.append(["CPU型号", cpu_info['Model name']])
+        if 'CPU(s)' in cpu_info:
+            data.append(["CPU核心数", cpu_info['CPU(s)']])
+        if 'Thread(s) per core' in cpu_info:
+            data.append(["每核线程数", cpu_info['Thread(s) per core']])
+        if 'CPU max MHz' in cpu_info:
+            data.append(["最大频率", f"{cpu_info['CPU max MHz']} MHz"])
+        elif 'CPU MHz' in cpu_info:
+            data.append(["频率", f"{cpu_info['CPU MHz']} MHz"])
+        
+        # 添加负载信息
+        if load_info:
+            load_match = re.search(r'load average:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)', load_info)
+            if load_match:
+                data.append(["1分钟负载", load_match.group(1)])
+                data.append(["5分钟负载", load_match.group(2)])
+                data.append(["15分钟负载", load_match.group(3)])
+        
+        return {"columns": ["CPU信息", "值"], "data": data}
+    
+    def _parse_memory_info(self, output):
+        """解析内存信息"""
+        lines = output.split('\n')
+        data = []
+        
+        if len(lines) >= 2:
+            # 解析内存行
+            mem_line = lines[1].split()
+            if len(mem_line) >= 7:
+                data.append(["总内存", mem_line[1]])
+                data.append(["已用内存", mem_line[2]])
+                data.append(["空闲内存", mem_line[3]])
+                data.append(["共享内存", mem_line[4]])
+                data.append(["缓存/缓冲", mem_line[5]])
+                data.append(["可用内存", mem_line[6]])
+            
+            # 解析交换空间
+            if len(lines) >= 3:
+                swap_line = lines[2].split()
+                if len(swap_line) >= 5:
+                    data.append(["总交换空间", swap_line[1]])
+                    data.append(["已用交换空间", swap_line[2]])
+                    data.append(["空闲交换空间", swap_line[3]])
+        
+        return {"columns": ["内存类型", "大小"], "data": data}
+    
+    def _parse_disk_info(self, output):
+        """解析磁盘信息"""
+        lines = output.split('\n')
+        data = []
+        
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 6:
+                filesystem = parts[0]
+                size = parts[1]
+                used = parts[2]
+                avail = parts[3]
+                use_percent = parts[4]
+                mounted_on = parts[5]
+                
+                # 只显示主要文件系统
+                if mounted_on in ['/', '/boot', '/home', '/var', '/opt', '/usr']:
+                    data.append([mounted_on, filesystem, size, used, avail, use_percent])
+        
+        # 限制显示数量
+        data = data[:10]
+        
+        return {"columns": ["挂载点", "文件系统", "总大小", "已用", "可用", "使用率"], "data": data}
+
+# PostgreSQL数据库连接 - 修复版本
+class PostgreSQLConnector:
+    def __init__(self, db_info, encryptor):
+        self.db_info = db_info
+        self.encryptor = encryptor
+        self.connection = None
+    
+    def connect(self):
+        try:
+            # 重要修复：确保密码已解密
+            password = self.db_info.get('password', '')
+            
+            # 如果密码可能是加密的，尝试解密
+            if password and self._is_encrypted_format(password):
+                password = self.encryptor.decrypt_password(password)
+                ConsolePrinter.print_info("数据库密码已自动解密")
+            
+            conn_params = {
+                'host': self.db_info.get('host', 'localhost'),
+                'port': self.db_info.get('port', 5432),  # 默认端口5432
+                'database': self.db_info.get('database', 'postgres'),
+                'user': self.db_info.get('user', 'postgres'),
+                'password': password,  # 使用可能解密后的密码
+                'connect_timeout': 10
+            }
+            
+            ConsolePrinter.print_info(f"连接参数: host={conn_params['host']}, port={conn_params['port']}, database={conn_params['database']}, user={conn_params['user']}")
+            
+            self.connection = psycopg2.connect(**conn_params)
+            ConsolePrinter.print_success(f"成功连接到 PostgreSQL 数据库")
+            return True
+        except OperationalError as e:
+            ConsolePrinter.print_error(f"连接失败: {e}")
+            # 提供更详细的诊断信息
+            self._diagnose_connection_issue()
+            return False
+        except Exception as e:
+            ConsolePrinter.print_error(f"连接错误: {e}")
+            return False
+    
+    def _diagnose_connection_issue(self):
+        """诊断连接问题"""
+        ConsolePrinter.print_warning("连接问题诊断:")
+        host = self.db_info.get('host', 'localhost')
+        port = self.db_info.get('port', 5432)
+        
+        # 检查端口号
+        if port != 5432:
+            ConsolePrinter.print_warning(f"⚠️  使用非标准端口: {port} (PostgreSQL默认端口是5432)")
+        
+        # 检查网络连通性
+        try:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            result = sock.connect_ex((host, port))
+            sock.close()
+            
+            if result == 0:
+                ConsolePrinter.print_info("✅ 网络连接正常")
+            else:
+                ConsolePrinter.print_error(f"❌ 网络连接失败: 无法连接到 {host}:{port}")
+                ConsolePrinter.print_info("💡 请检查:")
+                ConsolePrinter.print_info("  - 主机IP地址是否正确")
+                ConsolePrinter.print_info("  - 端口号是否正确")
+                ConsolePrinter.print_info("  - 防火墙设置")
+                ConsolePrinter.print_info("  - 网络连通性")
+        except Exception as e:
+            ConsolePrinter.print_warning(f"网络诊断失败: {e}")
+    
+    def _is_encrypted_format(self, password):
+        """判断密码是否是加密格式"""
+        password_str = str(password)
+        # 检查是否是base64格式（加密后的特征）
+        try:
+            if len(password_str) > 50 and re.match(r'^[A-Za-z0-9-_]*={0,2}$', password_str):
+                return True
+            return False
+        except:
+            return False
+    
+    def execute_query(self, sql):
+        """执行SQL查询并返回结果"""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(sql)
+            
+            # 获取列名
+            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            data = cursor.fetchall()
+            
+            cursor.close()
+            return {"columns": columns, "data": data}
+        except Exception as e:
+            ConsolePrinter.print_warning(f"SQL执行失败: {e}")
+            return {"columns": [], "data": []}
+    
+    def close(self):
+        if self.connection:
+            self.connection.close()
+
+# PostgreSQL健康检查核心类
+class PostgreSQLHealthChecker:
+    def __init__(self, db_connector, db_info=None):
+        self.db = db_connector
+        self.db_info = db_info  # 修复：添加db_info属性
+        self.results = {}
+        self.check_status = {}
+    
+    def check_version_info(self):
+        """检查数据库版本信息"""
+        sql = "SELECT version();"
+        result = self.db.execute_query(sql)
+        self.check_status['版本信息'] = len(result['data']) > 0
+        return result
+    
+    def check_instance_info(self):
+        """检查实例信息"""
+        sql = """
+        SELECT 
+            pg_postmaster_start_time() as pg_start_time,
+            extract(epoch from now() - pg_postmaster_start_time()) as run_time_seconds,
+            pg_conf_load_time() as config_file_load_time,
+            inet_server_addr() as server_ip,
+            inet_server_port() as server_port,
+            inet_client_addr() as client_ip,
+            inet_client_port() as client_port,
+            version() as server_version,
+            (CASE WHEN pg_is_in_recovery()='f' THEN 'primary' ELSE 'standby' END) as primary_or_standby,
+            now() as now_date
+        """
+        result = self.db.execute_query(sql)
+        self.check_status['实例信息'] = len(result['data']) > 0
+        return result
+    
+    def check_database_info(self):
+        """检查数据库基本信息"""
+        sql = """
+        SELECT 
+            d.datname as "数据库名",
+            pg_catalog.pg_get_userbyid(d.datdba) as "所有者",
+            pg_catalog.pg_encoding_to_char(d.encoding) as "编码",
+            d.datcollate as "排序规则",
+            d.datctype as "字符类型",
+            CASE WHEN pg_catalog.has_database_privilege(d.datname, 'CONNECT')
+                THEN pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname))
+                ELSE 'No Access'
+            END as "大小",
+            t.spcname as "表空间",
+            age(datfrozenxid) as 事务年龄
+        FROM pg_catalog.pg_database d
+        JOIN pg_catalog.pg_tablespace t on d.dattablespace = t.oid
+        WHERE d.datname NOT IN ('template0', 'template1')
+        ORDER BY pg_catalog.pg_database_size(d.datname) DESC
+        """
+        result = self.db.execute_query(sql)
+        self.check_status['数据库信息'] = len(result['data']) > 0
+        return result
+    
+    def check_tablespace_info(self):
+        """检查表空间信息"""
+        sql = """
+        SELECT 
+            oid,
+            spcname AS "表空间名",
+            pg_catalog.pg_get_userbyid(spcowner) AS "所有者",
+            pg_catalog.pg_tablespace_location(oid) AS "位置",
+            pg_catalog.pg_size_pretty(pg_catalog.pg_tablespace_size(oid)) AS "大小",
+            pg_catalog.shobj_description(oid, 'pg_tablespace') AS "描述"
+        FROM pg_catalog.pg_tablespace
+        ORDER BY pg_catalog.pg_tablespace_size(oid) DESC
+        """
+        result = self.db.execute_query(sql)
+        self.check_status['表空间信息'] = len(result['data']) > 0
+        return result
+    
+    def check_connection_info(self):
+        """检查连接信息"""
+        sql = """
+        SELECT 
+            count(*) as 总连接数,
+            (SELECT setting::int8 FROM pg_settings WHERE name = 'max_connections') as 最大连接数,
+            count(*) filter (where state = 'active') as 活动连接数,
+            count(*) filter (where state = 'idle') as 空闲连接数,
+            count(*) filter (where state = 'idle in transaction') as 空闲事务连接数,
+            count(*) filter (where state = 'idle in transaction (aborted)') as 空闲事务异常连接数
+        FROM pg_stat_activity 
+        WHERE datname = current_database()
+        """
+        result = self.db.execute_query(sql)
+        self.check_status['连接信息'] = len(result['data']) > 0
+        return result
+    
+    def check_top_tables(self):
+        """检查大表TOP 20 - 修复版本"""
+        sql = """
+        SELECT
+            n.nspname AS 模式名,
+            c.relname as 表名,
+            c.reltuples::bigint as 行数,
+            pg_size_pretty(pg_table_size(c.oid)) AS 表大小,
+            pg_size_pretty(pg_indexes_size(c.oid)) AS 索引大小,
+            pg_size_pretty(pg_total_relation_size(c.oid)) AS 总大小,
+            CASE 
+                WHEN c.reltuples > 0 THEN 
+                    round((pg_total_relation_size(c.oid)::numeric / 1024 / 1024 / c.reltuples)::numeric, 2)
+                ELSE 0 
+            END as 平均行大小_KB
+        FROM pg_class c 
+        LEFT JOIN pg_namespace N ON (N.oid = c.relnamespace) 
+        WHERE nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast') 
+        AND nspname !~ '^pg_temp'
+        AND c.relkind in ('r','p')  
+        AND c.reltuples > 0
+        ORDER BY pg_total_relation_size(c.oid) DESC 
+        LIMIT 20
+        """
+        result = self.db.execute_query(sql)
+        self.check_status['大表TOP20'] = len(result['data']) > 0
+        
+        # 如果没有数据，添加提示信息
+        if not result['data']:
+            result['data'] = [('无大表', '', '', '', '', '', '')]
+            result['columns'] = ['状态说明', '', '', '', '', '', '']
+        
+        return result
+    
+    def check_locks_info(self):
+        """检查锁信息"""
+        sql = """
+        SELECT 
+            locktype as 锁类型,
+            mode as 锁模式,
+            granted as 是否授予,
+            relation::regclass as 关联对象,
+            transactionid as 事务ID,
+            pid as 进程ID
+        FROM pg_locks 
+        WHERE relation IS NOT NULL
+        ORDER BY locktype, mode
+        LIMIT 50
+        """
+        result = self.db.execute_query(sql)
+        self.check_status['锁信息'] = len(result['data']) > 0
+        
+        # 如果没有数据，添加提示信息
+        if not result['data']:
+            result['data'] = [('当前无锁等待', '', '', '', '', '')]
+            result['columns'] = ['状态说明', '', '', '', '', '']
+        
+        return result
+    
+    def check_slow_queries(self):
+        """检查慢查询"""
+        sql = """
+        SELECT 
+            pid as 进程ID,
+            datname as 数据库名,
+            usename as 用户名,
+            application_name as 应用名,
+            client_addr as 客户端IP,
+            state as 状态,
+            backend_start as 后台开始时间,
+            xact_start as 事务开始时间,
+            query_start as 查询开始时间,
+            TRUNC(EXTRACT(epoch FROM (NOW() - xact_start))) AS 事务运行秒数,
+            TRUNC(EXTRACT(epoch FROM (NOW() - query_start))) AS 查询运行秒数,
+            LEFT(query, 100) as 查询语句
+        FROM pg_stat_activity 
+        WHERE state NOT IN ('idle', 'idle in transaction (aborted)')
+        AND query_start IS NOT NULL
+        AND (NOW() - query_start) > interval '5 minutes'
+        ORDER BY (NOW() - query_start) DESC
+        LIMIT 20
+        """
+        result = self.db.execute_query(sql)
+        self.check_status['慢查询'] = len(result['data']) > 0
+        
+        # 如果没有数据，添加提示信息
+        if not result['data']:
+            result['data'] = [('当前无慢查询', '', '', '', '', '', '', '', '', '', '', '')]
+            result['columns'] = ['状态说明', '', '', '', '', '', '', '', '', '', '', '']
+        
+        return result
+    
+    def check_replication_info(self):
+        """检查复制信息"""
+        sql = """
+        SELECT 
+            application_name as 应用名,
+            client_addr as 客户端地址,
+            state as 状态,
+            sync_state as 同步状态,
+            write_lag as 写入延迟,
+            flush_lag as 刷新延迟,
+            replay_lag as 回放延迟
+        FROM pg_stat_replication
+        """
+        result = self.db.execute_query(sql)
+        self.check_status['复制信息'] = len(result['data']) > 0
+        
+        # 如果没有数据，添加提示信息
+        if not result['data']:
+            result['data'] = [('当前无复制信息', '', '', '', '', '', '')]
+            result['columns'] = ['状态说明', '', '', '', '', '', '']
+        
+        return result
+    
+    def check_index_usage(self):
+        """检查索引使用情况"""
+        sql = """
+        SELECT 
+            schemaname || '.' || relname AS 表名,
+            indexrelname AS 索引名,
+            pg_size_pretty(pg_relation_size(indexrelid)) AS 索引大小,
+            idx_scan as 扫描次数,
+            idx_tup_read as 读取元组数,
+            idx_tup_fetch as 获取元组数,
+            CASE 
+                WHEN idx_scan > 0 THEN 
+                    ROUND((idx_tup_fetch::numeric / idx_scan)::numeric, 2)
+                ELSE 0 
+            END as 平均获取元组数
+        FROM pg_stat_user_indexes 
+        ORDER BY pg_relation_size(indexrelid) DESC
+        LIMIT 20
+        """
+        result = self.db.execute_query(sql)
+        self.check_status['索引使用'] = len(result['data']) > 0
+        return result
+    
+    def check_cache_hit_ratio(self):
+        """检查缓存命中率"""
+        sql = """
+        SELECT 
+            datname as 数据库名,
+            blks_read as 磁盘块读取,
+            blks_hit as 缓存块命中,
+            CASE WHEN (blks_read + blks_hit) > 0 
+                THEN ROUND((blks_hit::numeric / (blks_read + blks_hit)) * 100, 2) 
+                ELSE 0 
+            END as 命中率百分比,
+            xact_commit as 提交事务数,
+            xact_rollback as 回滚事务数,
+            tup_returned as 返回元组数,
+            tup_fetched as 获取元组数,
+            tup_inserted as 插入元组数,
+            tup_updated as 更新元组数,
+            tup_deleted as 删除元组数
+        FROM pg_stat_database 
+        WHERE datname = current_database()
+        """
+        result = self.db.execute_query(sql)
+        self.check_status['缓存命中率'] = len(result['data']) > 0
+        return result
+    
+    def check_table_bloat(self):
+        """检查表膨胀"""
+        sql = """
+        SELECT
+            schemaname || '.' || relname as 表名,
+            n_live_tup as 活元组数,
+            n_dead_tup as 死元组数,
+            CASE WHEN (n_live_tup + n_dead_tup) > 0 
+                THEN ROUND((n_dead_tup::numeric / (n_live_tup + n_dead_tup)) * 100, 2) 
+                ELSE 0 
+            END as 死元组百分比,
+            pg_size_pretty(pg_relation_size(schemaname||'.'||relname)) as 表大小,
+            last_vacuum as 最后vacuum时间,
+            last_autovacuum as 最后自动vacuum时间,
+            last_analyze as 最后analyze时间,
+            last_autoanalyze as 最后自动analyze时间
+        FROM pg_stat_all_tables 
+        WHERE n_dead_tup > 1000
+        ORDER BY n_dead_tup DESC
+        LIMIT 20
+        """
+        result = self.db.execute_query(sql)
+        self.check_status['表膨胀'] = len(result['data']) > 0
+        
+        # 如果没有数据，添加提示信息
+        if not result['data']:
+            result['data'] = [('无表膨胀问题', '', '', '', '', '', '', '', '')]
+            result['columns'] = ['状态说明', '', '', '', '', '', '', '', '']
+        
+        return result
+    
+    def check_wal_info(self):
+        """检查WAL信息"""
+        sql = """
+        SELECT 
+            checkpoints_timed as 计划检查点,
+            checkpoints_req as 请求检查点,
+            checkpoint_write_time as 检查点写入时间,
+            checkpoint_sync_time as 检查点同步时间,
+            buffers_checkpoint as 检查点缓冲区,
+            buffers_clean as 清理缓冲区,
+            maxwritten_clean as 最大写入清理,
+            buffers_backend as 后端缓冲区,
+            buffers_backend_fsync as 后端fsync,
+            buffers_alloc as 分配缓冲区
+        FROM pg_stat_bgwriter
+        """
+        result = self.db.execute_query(sql)
+        self.check_status['WAL信息'] = len(result['data']) > 0
+        return result
+    
+    def run_all_checks(self, include_host_check=True, ssh_info=None):
+        """运行所有检查"""
+        checks = [
+            ("版本信息", self.check_version_info),
+            ("实例信息", self.check_instance_info),
+            ("数据库信息", self.check_database_info),
+            ("表空间信息", self.check_tablespace_info),
+            ("连接信息", self.check_connection_info),
+            ("大表TOP20", self.check_top_tables),
+            ("锁信息", self.check_locks_info),
+            ("慢查询", self.check_slow_queries),
+            ("复制信息", self.check_replication_info),
+            ("索引使用", self.check_index_usage),
+            ("缓存命中率", self.check_cache_hit_ratio),
+            ("表膨胀", self.check_table_bloat),
+            ("WAL信息", self.check_wal_info)
+        ]
+        
+        ConsolePrinter.print_title("开始PostgreSQL健康检查")
+        
+        for i, (name, check_func) in enumerate(checks, 1):
+            ConsolePrinter.print_progress(i, len(checks), prefix="检查进度", suffix=name)
+            self.results[name] = check_func()
+        
+        # 添加SSH主机检查（如果启用且有SSH凭据）
+        if include_host_check and ssh_info and ssh_info.get('ssh_user') and ssh_info.get('ssh_password'):
+            ConsolePrinter.print_info("开始SSH主机系统资源检查...")
+            
+            # 修复：安全地获取主机信息
+            if self.db_info and 'host' in self.db_info:
+                host = self.db_info['host']
+            else:
+                host = 'localhost'
+                ConsolePrinter.print_warning("无法获取数据库主机信息，使用默认主机localhost进行SSH检查")
+            
+            ssh_host_info = {
+                'host': host,
+                'ssh_port': ssh_info.get('ssh_port', 22),
+                'ssh_user': ssh_info['ssh_user'],
+                'ssh_password': ssh_info['ssh_password']
+            }
+            
+            ssh_checker = SSHHostChecker(ssh_host_info, self.db.encryptor)
+            ssh_results = ssh_checker.check_via_ssh()
+            
+            if ssh_results:
+                # 合并SSH检查结果
+                for key, value in ssh_results.items():
+                    self.results[f"SSH_{key}"] = value
+            else:
+                ConsolePrinter.print_warning(f"SSH主机检查失败: {host}")
+        
+        ConsolePrinter.print_success("所有检查完成")
+        return self.results
+
+# 批量巡检管理器（Excel模板版）- 增强安全版
+class BatchInspectionManager:
+    def __init__(self, license_manager, encryptor):
+        self.template_dir = self.get_template_dir()
+        self.results = {}
+        self.license_manager = license_manager
+        self.encryptor = encryptor
+        self.connection_tester = ConnectionTester(encryptor)
+    
+    def get_template_dir(self):
+        """获取模板目录"""
+        if getattr(sys, 'frozen', False):
+            base_path = os.path.dirname(sys.executable)
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        
+        template_dir = os.path.join(base_path, 'inspection_templates')
+        os.makedirs(template_dir, exist_ok=True)
+        return template_dir
+    
+    def generate_excel_template(self, template_name=None):
+        """生成Excel批量巡检模板 - 修复端口号问题"""
+        if not HAS_EXCEL:
+            ConsolePrinter.print_error("未安装openpyxl，无法生成Excel模板")
+            return None
+        
+        if not template_name:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            template_name = f"postgresql_batch_template_{timestamp}.xlsx"
+        
+        template_path = os.path.join(self.template_dir, template_name)
+        
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "数据库列表"
+            
+            # 设置表头 - 增加SSH相关字段
+            headers = [
+                "名称", "主机IP", "端口", "数据库名", "用户名", 
+                "密码", "描述", "启用检查", "优先级", "包含主机检查",
+                "SSH用户名", "SSH密码", "SSH端口"
+            ]
+            
+            for col, header in enumerate(headers, 1):
+                ws.cell(1, col, header)
+                ws.cell(1, col).font = Font(bold=True, color="FFFFFF")
+                ws.cell(1, col).fill = PatternFill(start_color="2E5A62", end_color="2E5A62", fill_type="solid")
+                ws.cell(1, col).alignment = Alignment(horizontal="center")
+            
+            # 添加示例数据 - 修复：使用正确的端口号5432
+            sample_data = [
+                ["生产数据库主库", "192.168.1.100", 5432, "postgres", "postgres", 
+                 "postgres123", 
+                 "生产环境主数据库", "是", 1, "是", "root", 
+                 "sshpassword123", 22],
+                ["生产数据库备库", "192.168.1.101", 5432, "postgres", "postgres", 
+                 "postgres123", 
+                 "生产环境备数据库", "是", 2, "是", "root", 
+                 "sshpassword123", 22],
+                ["测试数据库", "192.168.1.200", 5432, "test_db", "test_user", 
+                 "test123", 
+                 "测试环境数据库", "是", 3, "否", "", "", 22],
+                ["开发数据库", "192.168.1.201", 5432, "dev_db", "dev_user", 
+                 "dev123", 
+                 "开发环境数据库", "否", 4, "否", "", "", 22]
+            ]
+            
+            for row, data in enumerate(sample_data, 2):
+                for col, value in enumerate(data, 1):
+                    ws.cell(row, col, value)
+            
+            # 添加说明工作表
+            ws_desc = wb.create_sheet("使用说明")
+            instructions = [
+                ["PostgreSQL批量巡检模板使用说明"],
+                [""],
+                ["🔐 安全说明"],
+                ["1. 模板中的密码字段会自动加密存储，提高安全性"],
+                ["2. 加密密钥基于机器特征生成，模板不可跨机器使用"],
+                ["3. 请勿将模板文件分享给未经授权的人员"],
+                ["4. 建议定期更换数据库和SSH密码"],
+                [""],
+                ["📋 模板说明"],
+                ["1. 请在'数据库列表'工作表中填写要检查的数据库信息"],
+                ["2. 必填字段：名称、主机IP、端口、数据库名、用户名、密码"],
+                ["3. 重要：PostgreSQL默认端口是5432，请确认您的数据库端口"],
+                ["4. 可选字段：描述、启用检查、优先级、包含主机检查、SSH信息"],
+                ["5. '启用检查'列：填写'是'或'否'，控制是否检查该数据库"],
+                ["6. '优先级'列：数字越小优先级越高，用于控制检查顺序"],
+                ["7. '包含主机检查'列：填写'是'或'否'，控制是否检查主机系统资源"],
+                ["8. 'SSH用户名/密码/端口'：用于远程主机检查，如不需要可留空"],
+                [""],
+                ["🔧 检查配置"],
+                ["1. 支持并发检查多个数据库"],
+                ["2. 可生成Word和Excel格式报告"],
+                ["3. 自动生成检查汇总报告"],
+                ["4. 支持通过SSH检查远程主机资源"],
+                [""],
+                ["⚠️ 注意事项"],
+                ["1. 请确保网络连通性和数据库访问权限"],
+                ["2. 建议先在少量数据库上测试"],
+                ["3. 密码信息请妥善保管"],
+                ["4. 支持检查200+台数据库"],
+                ["5. SSH主机检查需要paramiko库"]
+            ]
+            
+            for row, instruction in enumerate(instructions, 1):
+                ws_desc.cell(row, 1, instruction[0])
+                if row == 1:
+                    ws_desc.cell(row, 1).font = Font(bold=True, size=14)
+                if row in [3, 4, 5, 6]:
+                    ws_desc.cell(row, 1).font = Font(bold=True, color="FF0000")
+            
+            # 设置列宽
+            for col in range(1, 14):
+                ws.column_dimensions[get_column_letter(col)].width = 15
+            
+            ws_desc.column_dimensions['A'].width = 80
+            
+            # 保存模板
+            wb.save(template_path)
+            
+            ConsolePrinter.print_success(f"Excel批量巡检模板已生成: {template_path}")
+            ConsolePrinter.print_info("🔐 安全提示：模板中的密码字段将在使用前自动加密")
+            ConsolePrinter.print_info("📝 重要提示：请确认数据库端口号正确（PostgreSQL默认端口5432）")
+            ConsolePrinter.print_info("请编辑模板文件中的数据库信息，然后使用批量巡检功能")
+            return template_path
+            
+        except Exception as e:
+            ConsolePrinter.print_error(f"生成Excel模板失败: {e}")
+            return None
+    
+    def encrypt_excel_passwords(self, template_path):
+        """加密Excel模板中的密码字段 - 安全版本"""
+        if not HAS_EXCEL:
+            return False
+        
+        try:
+            wb = openpyxl.load_workbook(template_path)
+            ws = wb["数据库列表"]
+            
+            headers = []
+            # 读取表头
+            for col in range(1, 14):
+                header = ws.cell(1, col).value
+                if header:
+                    headers.append(header)
+                else:
+                    break
+            
+            # 查找密码列索引
+            db_password_col = None
+            ssh_password_col = None
+            
+            for col, header in enumerate(headers, 1):
+                if header == "密码":
+                    db_password_col = col
+                elif header == "SSH密码":
+                    ssh_password_col = col
+            
+            # 加密密码字段
+            encrypted_count = 0
+            for row in range(2, ws.max_row + 1):
+                # 加密数据库密码 - 只对非加密格式的密码进行加密
+                if db_password_col:
+                    password_cell = ws.cell(row, db_password_col)
+                    password_value = str(password_cell.value) if password_cell.value is not None else ""
+                    
+                    # 如果密码不为空且不是加密格式，则加密
+                    if password_value and password_value.strip():
+                        if not self._is_encrypted_format(password_value):
+                            encrypted = self.encryptor.encrypt_password(password_value)
+                            password_cell.value = encrypted
+                            encrypted_count += 1
+                
+                # 加密SSH密码 - 只对非加密格式的密码进行加密
+                if ssh_password_col:
+                    ssh_password_cell = ws.cell(row, ssh_password_col)
+                    ssh_password_value = str(ssh_password_cell.value) if ssh_password_cell.value is not None else ""
+                    
+                    # 如果SSH密码不为空且不是加密格式，则加密
+                    if ssh_password_value and ssh_password_value.strip():
+                        if not self._is_encrypted_format(ssh_password_value):
+                            encrypted = self.encryptor.encrypt_password(ssh_password_value)
+                            ssh_password_cell.value = encrypted
+                            encrypted_count += 1
+            
+            # 保存加密后的模板
+            wb.save(template_path)
+            
+            if encrypted_count > 0:
+                ConsolePrinter.print_success(f"已加密 {encrypted_count} 个密码字段")
+            
+            return True
+            
+        except Exception as e:
+            ConsolePrinter.print_error(f"加密Excel密码失败: {e}")
+            return False
+    
+    def _is_encrypted_format(self, password):
+        """判断密码是否是加密格式"""
+        password_str = str(password)
+        # 检查是否是base64格式（加密后的特征）
+        try:
+            if len(password_str) > 50 and re.match(r'^[A-Za-z0-9-_]*={0,2}$', password_str):
+                return True
+            return False
+        except:
+            return False
+    
+    def load_excel_template(self, template_path):
+        """加载Excel批量巡检模板 - 安全版本"""
+        if not HAS_EXCEL:
+            ConsolePrinter.print_error("未安装openpyxl，无法加载Excel模板")
+            return None
+        
+        try:
+            wb = openpyxl.load_workbook(template_path)
+            ws = wb["数据库列表"]
+            
+            databases = []
+            headers = []
+            
+            # 读取表头
+            for col in range(1, 14):  # 假设最多13列
+                header = ws.cell(1, col).value
+                if header:
+                    headers.append(header)
+                else:
+                    break
+            
+            # 读取数据行
+            for row in range(2, ws.max_row + 1):
+                # 检查是否启用
+                enabled_cell = ws.cell(row, 8).value if len(headers) >= 8 else "是"
+                enabled_value = str(enabled_cell).strip().lower() if enabled_cell is not None else "是"
+                if enabled_value in ["否", "no", "false", "0"]:
+                    continue
+                
+                db_info = {}
+                for col, header in enumerate(headers, 1):
+                    value = ws.cell(row, col).value
+                    if value is not None:
+                        # 根据表头映射字段
+                        if header == "名称":
+                            db_info["name"] = str(value)
+                        elif header == "主机IP":
+                            db_info["host"] = str(value)
+                        elif header == "端口":
+                            # 确保端口是整数
+                            try:
+                                db_info["port"] = int(value) if value else 5432
+                            except (ValueError, TypeError):
+                                db_info["port"] = 5432
+                        elif header == "数据库名":
+                            db_info["database"] = str(value)
+                        elif header == "用户名":
+                            db_info["user"] = str(value)
+                        elif header == "密码":
+                            # 密码字段 - 在连接时自动解密
+                            db_info["password"] = str(value)
+                        elif header == "描述":
+                            db_info["description"] = str(value)
+                        elif header == "启用检查":
+                            db_info["enabled"] = str(value).strip().lower() in ["是", "yes", "true", "1"]
+                        elif header == "优先级":
+                            try:
+                                db_info["priority"] = int(value) if value else 999
+                            except (ValueError, TypeError):
+                                db_info["priority"] = 999
+                        elif header == "包含主机检查":
+                            db_info["include_host_check"] = str(value).strip().lower() in ["是", "yes", "true", "1"]
+                        elif header == "SSH用户名":
+                            db_info["ssh_user"] = str(value) if value else None
+                        elif header == "SSH密码":
+                            # SSH密码字段 - 在连接时自动解密
+                            db_info["ssh_password"] = str(value) if value else None
+                        elif header == "SSH端口":
+                            try:
+                                db_info["ssh_port"] = int(value) if value else 22
+                            except (ValueError, TypeError):
+                                db_info["ssh_port"] = 22
+                
+                # 验证必要字段
+                required_fields = ["name", "host", "database", "user", "password"]
+                if all(field in db_info for field in required_fields):
+                    databases.append(db_info)
+            
+            if not databases:
+                ConsolePrinter.print_error("模板中未找到有效的数据库配置")
+                return None
+            
+            template_info = {
+                "template_name": f"Excel模板: {os.path.basename(template_path)}",
+                "description": "从Excel文件加载的数据库列表",
+                "loaded_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "databases": databases
+            }
+            
+            ConsolePrinter.print_success(f"Excel模板加载成功: {template_path}")
+            ConsolePrinter.print_info(f"数据库数量: {len(databases)}")
+            
+            return template_info
+            
+        except Exception as e:
+            ConsolePrinter.print_error(f"加载Excel模板失败: {e}")
+            return None
+    
+    def list_templates(self):
+        """列出所有可用模板"""
+        excel_templates = []
+        
+        for file in os.listdir(self.template_dir):
+            if file.endswith('.xlsx'):
+                excel_templates.append(file)
+        
+        if excel_templates:
+            ConsolePrinter.print_info("可用模板列表:")
+            print("\n📊 Excel模板:")
+            for i, template in enumerate(excel_templates, 1):
+                print(f"  {i}. {template}")
+        else:
+            ConsolePrinter.print_warning("未找到任何模板文件")
+        
+        return excel_templates
+    
+    def test_template_connections(self, template_path):
+        """测试模板中所有数据库的连接"""
+        template = self.load_excel_template(template_path)
+        if not template:
+            return False
+        
+        databases = template.get('databases', [])
+        if not databases:
+            ConsolePrinter.print_error("模板中未找到有效的数据库配置")
+            return False
+        
+        ConsolePrinter.print_title(f"测试模板连接 - 共{len(databases)}个数据库")
+        
+        success_count = 0
+        for db_info in databases:
+            ConsolePrinter.print_info(f"测试数据库: {db_info['name']} ({db_info['host']}:{db_info.get('port', 5432)})")
+            
+            # 测试数据库连接
+            db_success = self.connection_tester.test_postgresql_connection(db_info)
+            
+            # 测试SSH连接（如果配置了）
+            if db_info.get('include_host_check') and db_info.get('ssh_user') and db_info.get('ssh_password'):
+                ssh_success = self.connection_tester.test_ssh_connection(db_info)
+            else:
+                ssh_success = True  # 没有SSH配置视为成功
+            
+            if db_success and ssh_success:
+                success_count += 1
+                ConsolePrinter.print_success(f"✅ {db_info['name']} - 所有连接测试通过")
+            else:
+                ConsolePrinter.print_error(f"❌ {db_info['name']} - 连接测试失败")
+            
+            print()  # 空行分隔
+        
+        ConsolePrinter.print_title("连接测试完成")
+        ConsolePrinter.print_info(f"成功: {success_count}/{len(databases)}")
+        
+        if success_count == len(databases):
+            ConsolePrinter.print_success("所有数据库连接测试通过！")
+            return True
+        else:
+            ConsolePrinter.print_error("部分数据库连接测试失败，请检查配置")
+            return False
+    
+    def run_batch_inspection(self, template_path, output_format="both", max_workers=5, timeout=30):
+        """运行批量巡检 - 安全版本"""
+        # 检查许可证 - 使用修复后的方法
+        if not self.license_manager.check_license():
+            ConsolePrinter.print_error("许可证验证失败，无法执行批量巡检")
+            return False
+        
+        # 只支持Excel模板
+        if not template_path.endswith('.xlsx'):
+            ConsolePrinter.print_error("只支持Excel模板格式(.xlsx)")
+            return False
+        
+        # 加密模板中的密码（如果尚未加密）
+        ConsolePrinter.print_info("检查模板密码安全...")
+        self.encrypt_excel_passwords(template_path)
+        
+        template = self.load_excel_template(template_path)
+        if not template:
+            return False
+        
+        databases = template.get('databases', [])
+        if not databases:
+            ConsolePrinter.print_error("模板中未找到有效的数据库配置")
+            return False
+        
+        # 按优先级排序
+        databases.sort(key=lambda x: x.get('priority', 999))
+        
+        ConsolePrinter.print_title(f"开始批量巡检 - 共{len(databases)}个数据库")
+        ConsolePrinter.print_info(f"并发数量: {max_workers}")
+        ConsolePrinter.print_info(f"超时时间: {timeout}秒")
+        ConsolePrinter.print_info("🔐 密码安全: 所有密码已加密处理")
+        
+        success_count = 0
+        failed_count = 0
+        report_paths = []
+        failed_databases = []
+        
+        # 使用线程池并行执行
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_db = {
+                executor.submit(self.inspect_single_database, db, output_format, timeout): db 
+                for db in databases
+            }
+            
+            total = len(future_to_db)
+            completed = 0
+            
+            for future in as_completed(future_to_db):
+                db = future_to_db[future]
+                completed += 1
+                
+                try:
+                    result = future.result(timeout=timeout + 10)  # 额外10秒缓冲
+                    if result:
+                        success_count += 1
+                        report_paths.append({
+                            'database': db['name'],
+                            'path': result,
+                            'status': '成功'
+                        })
+                        ConsolePrinter.print_success(f"({completed}/{total}) 完成: {db['name']}")
+                    else:
+                        failed_count += 1
+                        failed_databases.append(db['name'])
+                        ConsolePrinter.print_error(f"({completed}/{total}) 失败: {db['name']}")
+                except Exception as e:
+                    failed_count += 1
+                    failed_databases.append(db['name'])
+                    ConsolePrinter.print_error(f"({completed}/{total}) 异常 {db['name']}: {e}")
+                
+                # 显示进度
+                ConsolePrinter.print_progress(completed, total, prefix="批量检查进度", 
+                                            suffix=f"成功: {success_count}, 失败: {failed_count}")
+        
+        # 生成汇总报告
+        summary_report = self.generate_summary_report(
+            template, success_count, failed_count, report_paths, failed_databases
+        )
+        
+        ConsolePrinter.print_title("批量巡检完成")
+        ConsolePrinter.print_success(f"成功: {success_count} 个数据库")
+        if failed_count > 0:
+            ConsolePrinter.print_error(f"失败: {failed_count} 个数据库")
+        
+        if failed_databases:
+            ConsolePrinter.print_warning("失败的数据库:")
+            for db_name in failed_databases:
+                print(f"  - {db_name}")
+        
+        if summary_report:
+            ConsolePrinter.print_success(f"汇总报告: {summary_report}")
+        
+        return True
+    
+    def inspect_single_database(self, db_info, output_format, timeout=30):
+        """检查单个数据库 - 修复版本"""
+        try:
+            # 创建数据库连接的副本，避免修改原始数据
+            db_info_copy = db_info.copy()
+            
+            # 重要修复：在连接前确保密码被正确解密
+            if 'password' in db_info_copy and db_info_copy['password']:
+                original_password = db_info_copy['password']
+                # 检查是否需要解密
+                if self._is_encrypted_format(original_password):
+                    db_info_copy['password'] = self.encryptor.decrypt_password(original_password)
+                    ConsolePrinter.print_info("数据库密码已解密")
+            
+            # 同样处理SSH密码
+            if 'ssh_password' in db_info_copy and db_info_copy['ssh_password']:
+                original_ssh_password = db_info_copy['ssh_password']
+                if self._is_encrypted_format(original_ssh_password):
+                    db_info_copy['ssh_password'] = self.encryptor.decrypt_password(original_ssh_password)
+                    ConsolePrinter.print_info("SSH密码已解密")
+            
+            # 设置连接超时
+            db_info_copy['connect_timeout'] = timeout
+            
+            connector = PostgreSQLConnector(db_info_copy, self.encryptor)
+            if not connector.connect():
+                return None
+            
+            # 确定是否包含主机检查
+            include_host_check = db_info.get('include_host_check', True)
+            
+            # 提取SSH信息
+            ssh_info = {}
+            if include_host_check and db_info_copy.get('ssh_user') and db_info_copy.get('ssh_password'):
+                ssh_info = {
+                    'ssh_user': db_info_copy.get('ssh_user'),
+                    'ssh_password': db_info_copy.get('ssh_password'),
+                    'ssh_port': db_info_copy.get('ssh_port', 22)
+                }
+            
+            # 修复：传入db_info参数
+            checker = PostgreSQLHealthChecker(connector, db_info_copy)
+            results = checker.run_all_checks(
+                include_host_check=include_host_check, 
+                ssh_info=ssh_info
+            )
+            
+            # 生成报告
+            generator = PostgreSQLReportGenerator(db_info, results, self.encryptor)
+            report_paths = []
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            db_name_safe = db_info['name'].replace(' ', '_').replace('/', '_').replace('\\', '_')
+            
+            report_dir = self.get_report_dir()
+            
+            if output_format in ["word", "both"] and HAS_DOCX:
+                word_path = os.path.join(report_dir, f"PG_检查_{db_name_safe}_{timestamp}.docx")
+                word_path = generator.generate_word_report(word_path)
+                if word_path:
+                    report_paths.append(word_path)
+            
+            if output_format in ["excel", "both"] and HAS_EXCEL:
+                excel_path = os.path.join(report_dir, f"PG_检查_{db_name_safe}_{timestamp}.xlsx")
+                excel_path = generator.generate_excel_report(excel_path)
+                if excel_path:
+                    report_paths.append(excel_path)
+            
+            connector.close()
+            return report_paths[0] if report_paths else None
+            
+        except Exception as e:
+            ConsolePrinter.print_error(f"检查数据库 {db_info['name']} 时出错: {e}")
+            return None
+    
+    def get_report_dir(self):
+        """获取报告目录"""
+        if getattr(sys, 'frozen', False):
+            base_path = os.path.dirname(sys.executable)
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        report_dir = os.path.join(base_path, 'batch_reports', f"巡检报告_{timestamp}")
+        os.makedirs(report_dir, exist_ok=True)
+        return report_dir
+    
+    def generate_summary_report(self, template, success_count, failed_count, report_paths, failed_databases):
+        """生成批量巡检汇总报告"""
+        try:
+            summary = {
+                "inspection_summary": {
+                    "template_name": template.get('template_name', '未知'),
+                    "inspection_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "total_databases": len(template.get('databases', [])),
+                    "success_count": success_count,
+                    "failed_count": failed_count,
+                    "success_rate": round(success_count / len(template.get('databases', [])) * 100, 2) if template.get('databases') else 0,
+                    "failed_databases": failed_databases
+                },
+                "report_files": report_paths,
+                "databases": template.get('databases', [])
+            }
+            
+            report_dir = self.get_report_dir()
+            summary_path = os.path.join(report_dir, "批量巡检汇总报告.json")
+            
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+            
+            # 同时生成Excel汇总报告
+            if HAS_EXCEL:
+                self.generate_excel_summary_report(summary, report_dir)
+            
+            return summary_path
+        except Exception as e:
+            ConsolePrinter.print_error(f"生成汇总报告失败: {e}")
+            return None
+    
+    def generate_excel_summary_report(self, summary, report_dir):
+        """生成Excel汇总报告"""
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "巡检汇总"
+            
+            # 汇总信息
+            ws.cell(1, 1, "PostgreSQL批量巡检汇总报告")
+            ws.cell(1, 1).font = Font(bold=True, size=16)
+            
+            summary_info = summary['inspection_summary']
+            info_rows = [
+                ["模板名称", summary_info['template_name']],
+                ["检查时间", summary_info['inspection_time']],
+                ["总数据库数", summary_info['total_databases']],
+                ["成功数量", summary_info['success_count']],
+                ["失败数量", summary_info['failed_count']],
+                ["成功率", f"{summary_info['success_rate']}%"],
+                ["安全状态", "🔐 密码已加密处理"]
+            ]
+            
+            for row, (label, value) in enumerate(info_rows, 3):
+                ws.cell(row, 1, label)
+                ws.cell(row, 2, value)
+                ws.cell(row, 1).font = Font(bold=True)
+            
+            # 报告文件列表
+            ws.cell(11, 1, "生成的报告文件")
+            ws.cell(11, 1).font = Font(bold=True)
+            
+            report_files = summary['report_files']
+            for row, report in enumerate(report_files, 12):
+                ws.cell(row, 1, report['database'])
+                ws.cell(row, 2, report['path'])
+                ws.cell(row, 3, report['status'])
+            
+            # 失败数据库列表
+            if summary_info['failed_databases']:
+                ws.cell(14 + len(report_files), 1, "失败的数据库")
+                ws.cell(14 + len(report_files), 1).font = Font(bold=True, color="FF0000")
+                
+                for row, db_name in enumerate(summary_info['failed_databases'], 15 + len(report_files)):
+                    ws.cell(row, 1, db_name)
+                    ws.cell(row, 1).font = Font(color="FF0000")
+            
+            # 设置样式
+            for row in ws.iter_rows():
+                for cell in row:
+                    cell.border = Border(
+                        left=Side(style='thin'),
+                        right=Side(style='thin'),
+                        top=Side(style='thin'),
+                        bottom=Side(style='thin')
+                    )
+            
+            # 调整列宽
+            for col in ['A', 'B', 'C']:
+                ws.column_dimensions[col].width = 30
+            
+            summary_excel_path = os.path.join(report_dir, "批量巡检汇总报告.xlsx")
+            wb.save(summary_excel_path)
+            
+            ConsolePrinter.print_success(f"Excel汇总报告: {summary_excel_path}")
+            
+        except Exception as e:
+            ConsolePrinter.print_warning(f"生成Excel汇总报告失败: {e}")
+
+# 报告生成器（优化版）- 安全增强版
+class PostgreSQLReportGenerator:
+    def __init__(self, db_info, check_results, encryptor):
+        self.db_info = db_info
+        self.results = check_results
+        self.encryptor = encryptor
+        
+        # 在报告中隐藏敏感信息
+        self._sanitize_db_info()
+    
+    def _sanitize_db_info(self):
+        """清理数据库信息中的敏感数据"""
+        # 在报告中不显示真实密码
+        pass  # 完全移除密码状态显示
+    
+    def generate_word_report(self, output_path=None):
+        """生成Word报告 - 完整版"""
+        if not HAS_DOCX:
+            ConsolePrinter.print_error("未安装python-docx，无法生成Word报告")
+            return None
+        
+        try:
+            doc = docx.Document()
+            
+            # 设置文档属性
+            doc.core_properties.title = f"PostgreSQL数据库健康检查报告 - {self.db_info.get('name', '未知')}"
+            doc.core_properties.author = "数据库管理员"
+            doc.core_properties.subject = "PostgreSQL健康检查"
+            
+            # 添加标题
+            title = doc.add_heading('', 0)
+            title_run = title.add_run("PostgreSQL数据库健康检查报告")
+            title_run.font.name = '宋体'
+            title_run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+            title_run.font.size = Pt(22)
+            title_run.font.bold = True
+            title_run.font.color.rgb = docx.shared.RGBColor(0, 0, 128)  # 深蓝色
+            title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            # 添加副标题
+            subtitle = doc.add_paragraph()
+            subtitle_run = subtitle.add_run(f"检查对象: {self.db_info.get('name', '未知数据库')}")
+            subtitle_run.font.name = '宋体'
+            subtitle_run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+            subtitle_run.font.size = Pt(14)
+            subtitle_run.font.color.rgb = docx.shared.RGBColor(128, 0, 0)  # 深红色
+            subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            # 基本信息表格 - 移除密码状态显示
+            doc.add_heading('📋 一、基本信息', level=1)
+            basic_info = [
+                ('检查对象', self.db_info.get('name', '未知')),
+                ('数据库地址', f"{self.db_info.get('host', '未知')}:{self.db_info.get('port', '5432')}"),
+                ('数据库名称', self.db_info.get('database', '未知')),
+                ('检查时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+                ('连接用户', self.db_info.get('user', '未知')),
+                ('描述信息', self.db_info.get('description', '无'))
+            ]
+            
+            # 添加SSH信息（如果存在）- 移除密码状态
+            if self.db_info.get('ssh_user'):
+                basic_info.append(('SSH用户', self.db_info.get('ssh_user', '未知')))
+            
+            # 添加版本信息
+            version_data = self.results.get('版本信息', {}).get('data', [])
+            if version_data:
+                version_info = version_data[0][0] if version_data[0] else '未知'
+                basic_info.append(('数据库版本', version_info))
+            
+            basic_table = doc.add_table(rows=len(basic_info), cols=2)
+            basic_table.style = 'Light Grid Accent 1'
+            
+            for i, (label, value) in enumerate(basic_info):
+                # 设置标签单元格
+                label_cell = basic_table.cell(i, 0)
+                label_cell.text = str(label)
+                label_cell.paragraphs[0].runs[0].font.bold = True
+                label_cell.paragraphs[0].runs[0].font.color.rgb = docx.shared.RGBColor(0, 0, 0)
+                
+                # 设置值单元格
+                value_cell = basic_table.cell(i, 1)
+                value_cell.text = str(value)
+            
+            # 添加其他检查结果 - 调整顺序，SSH信息在前
+            section_number = 2
+            section_order = [
+                ("SSH_系统信息", "🖥️ 二、系统信息"),
+                ("SSH_CPU信息", "⚙️ 三、CPU信息"),
+                ("SSH_内存信息", "💽 四、内存信息"),
+                ("SSH_磁盘信息", "💿 五、磁盘信息"),
+                ("实例信息", "📊 六、实例信息"),
+                ("数据库信息", "🗃️ 七、数据库信息"), 
+                ("表空间信息", "💾 八、表空间信息"),
+                ("连接信息", "🔗 九、连接信息"),
+                ("大表TOP20", "📈 十、大表TOP20"),
+                ("锁信息", "🔒 十一、锁信息"),
+                ("慢查询", "🐌 十二、慢查询"),
+                ("复制信息", "🔄 十三、复制信息"),
+                ("索引使用", "📑 十四、索引使用"),
+                ("缓存命中率", "💫 十五、缓存命中率"),
+                ("表膨胀", "📦 十六、表膨胀"),
+                ("WAL信息", "📝 十七、WAL信息")
+            ]
+            
+            # 创建有序的章节字典
+            section_titles = dict(section_order)
+            
+            # 按照指定顺序添加章节
+            for check_name, section_title in section_order:
+                if check_name not in self.results:
+                    continue
+                    
+                result = self.results[check_name]
+                if not result.get('data') or len(result.get('data', [])) == 0:
+                    continue
+                
+                doc.add_heading(section_title, level=1)
+                
+                # 创建表格
+                columns = result.get('columns', [])
+                data = result.get('data', [])
+                
+                if columns and data:
+                    table = doc.add_table(rows=len(data) + 1, cols=len(columns))
+                    table.style = 'Light Grid Accent 1'
+                    
+                    # 添加表头
+                    for col_idx, column_name in enumerate(columns):
+                        header_cell = table.cell(0, col_idx)
+                        header_cell.text = str(column_name)
+                        header_cell.paragraphs[0].runs[0].font.bold = True
+                    
+                    # 添加数据行
+                    for row_idx, row_data in enumerate(data):
+                        for col_idx, cell_value in enumerate(row_data):
+                            cell = table.cell(row_idx + 1, col_idx)
+                            cell.text = str(cell_value) if cell_value is not None else ""
+                
+                # 添加空行分隔
+                doc.add_paragraph()
+            
+            # 生成输出路径
+            if not output_path:
+                base_path = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+                reports_dir = os.path.join(base_path, 'reports')
+                if not os.path.exists(reports_dir):
+                    os.makedirs(reports_dir, exist_ok=True)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                db_name = self.db_info.get('name', 'UnknownDB').replace(' ', '_')
+                output_path = os.path.join(reports_dir, f"PostgreSQL_健康检查报告_{db_name}_{timestamp}.docx")
+            
+            # 保存文档
+            doc.save(output_path)
+            ConsolePrinter.print_success(f"Word报告生成成功: {output_path}")
+            return output_path
+            
+        except Exception as e:
+            ConsolePrinter.print_error(f"生成Word报告失败: {str(e)}")
+            return None
+
+    def generate_excel_report(self, output_path=None):
+        """生成Excel报告 - 完整版"""
+        if not HAS_EXCEL:
+            ConsolePrinter.print_error("未安装openpyxl，无法生成Excel报告")
+            return None
+        
+        try:
+            wb = Workbook()
+            
+            # 删除默认工作表
+            wb.remove(wb.active)
+            
+            # 概览工作表
+            overview_ws = wb.create_sheet("📊 检查概览", 0)
+            overview_headers = ['检查项', '状态', '记录数', '说明']
+            for col, header in enumerate(overview_headers, 1):
+                overview_ws.cell(row=1, column=col, value=header)
+                overview_ws.cell(row=1, column=col).font = Font(bold=True)
+            
+            row_idx = 2
+            for check_name, result in self.results.items():
+                status = "✅ 成功" if result.get('data') and len(result.get('data', [])) > 0 else "⚠️ 无数据"
+                record_count = len(result.get('data', []))
+                overview_ws.cell(row=row_idx, column=1, value=check_name)
+                overview_ws.cell(row=row_idx, column=2, value=status)
+                overview_ws.cell(row=row_idx, column=3, value=record_count)
+                overview_ws.cell(row=row_idx, column=4, value=f"获取{record_count}条记录")
+                row_idx += 1
+            
+            # 基本信息工作表 - 移除密码状态显示
+            info_ws = wb.create_sheet("📋 基本信息", 1)
+            basic_info = [
+                ('检查对象', self.db_info.get('name', '未知')),
+                ('数据库地址', f"{self.db_info.get('host', '未知')}:{self.db_info.get('port', '5432')}"),
+                ('数据库名称', self.db_info.get('database', '未知')),
+                ('检查时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+                ('连接用户', self.db_info.get('user', '未知')),
+                ('描述信息', self.db_info.get('description', '无'))
+            ]
+            
+            # 添加SSH信息（如果存在）- 移除密码状态
+            if self.db_info.get('ssh_user'):
+                basic_info.append(('SSH用户', self.db_info.get('ssh_user', '未知')))
+            
+            # 添加版本信息
+            version_data = self.results.get('版本信息', {}).get('data', [])
+            if version_data:
+                version_info = version_data[0][0] if version_data[0] else '未知'
+                basic_info.append(('数据库版本', version_info))
+            
+            for i, (label, value) in enumerate(basic_info, 1):
+                info_ws.cell(row=i, column=1, value=label)
+                info_ws.cell(row=i, column=2, value=value)
+                info_ws.cell(row=i, column=1).font = Font(bold=True)
+            
+            # 定义工作表顺序 - SSH信息在前
+            sheet_order = [
+                "SSH_系统信息", "SSH_CPU信息", "SSH_内存信息", "SSH_磁盘信息",
+                "实例信息", "数据库信息", "表空间信息", "连接信息", 
+                "大表TOP20", "锁信息", "慢查询", "复制信息", 
+                "索引使用", "缓存命中率", "表膨胀", "WAL信息"
+            ]
+            
+            # 按照指定顺序添加其他检查结果工作表
+            for check_name in sheet_order:
+                if check_name not in self.results:
+                    continue
+                    
+                result = self.results[check_name]
+                if not result.get('data') or len(result.get('data', [])) == 0:
+                    continue
+                
+                # 创建工作表
+                sheet_name = check_name[:31]  # Excel工作表名最大31字符
+                ws = wb.create_sheet(sheet_name)
+                
+                columns = result.get('columns', [])
+                data = result.get('data', [])
+                
+                if columns and data:
+                    # 添加表头
+                    for col_idx, column_name in enumerate(columns, 1):
+                        ws.cell(row=1, column=col_idx, value=str(column_name))
+                        ws.cell(row=1, column=col_idx).font = Font(bold=True)
+                    
+                    # 添加数据
+                    for row_idx, row_data in enumerate(data, 2):
+                        for col_idx, cell_value in enumerate(row_data, 1):
+                            ws.cell(row=row_idx, column=col_idx, value=str(cell_value) if cell_value is not None else "")
+            
+            # 生成输出路径
+            if not output_path:
+                base_path = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+                reports_dir = os.path.join(base_path, 'reports')
+                if not os.path.exists(reports_dir):
+                    os.makedirs(reports_dir, exist_ok=True)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                db_name = self.db_info.get('name', 'UnknownDB').replace(' ', '_')
+                output_path = os.path.join(reports_dir, f"PostgreSQL_健康检查报告_{db_name}_{timestamp}.xlsx")
+            
+            wb.save(output_path)
+            ConsolePrinter.print_success(f"Excel报告生成成功: {output_path}")
+            return output_path
+            
+        except Exception as e:
+            ConsolePrinter.print_error(f"生成Excel报告失败: {str(e)}")
+            return None
+
+# 交互式输入数据库信息 - 修复版本
+def input_db_info(encryptor):
+    """交互式输入PostgreSQL数据库连接信息"""
+    print("\n🎯 请输入PostgreSQL数据库连接信息")
+    
+    host = input("📍 主机地址 [localhost]: ").strip() or "localhost"
+    
+    port_input = input("🔌 端口 [5432]: ").strip()
+    port = int(port_input) if port_input and port_input.isdigit() else 5432
+    
+    database = input("🗃️ 数据库名 [postgres]: ").strip() or "postgres"
+    
+    user = input("👤 用户名 [postgres]: ").strip() or "postgres"
+    
+    import getpass
+    password = getpass.getpass("🔑 密码: ").strip()
+    
+    db_name = input("🏷️ 数据库标识名称(用于报告) [PostgreSQL_Server]: ").strip() or "PostgreSQL_Server"
+    
+    description = input("📝 描述信息 [可选]: ").strip() or ""
+    
+    include_host_check = input("🖥️ 是否包含主机系统检查? (y/n) [y]: ").strip().lower()
+    include_host_check = include_host_check != 'n'
+    
+    # SSH信息
+    ssh_info = {}
+    if include_host_check:
+        use_ssh = input("🔐 是否使用SSH进行远程主机检查? (y/n) [y]: ").strip().lower()
+        if use_ssh != 'n':
+            ssh_user = input("👤 SSH用户名 [root]: ").strip() or "root"
+            ssh_password = getpass.getpass("🔑 SSH密码: ").strip()
+            ssh_port_input = input("🔌 SSH端口 [22]: ").strip()
+            ssh_port = int(ssh_port_input) if ssh_port_input and ssh_port_input.isdigit() else 22
+            
+            if ssh_user and ssh_password:
+                ssh_info = {
+                    'ssh_user': ssh_user,
+                    'ssh_password': ssh_password,  # 使用明文密码
+                    'ssh_port': ssh_port
+                }
+            else:
+                ConsolePrinter.print_warning("未提供SSH凭据，将跳过主机检查")
+                include_host_check = False
+    
+    # 创建数据库信息（使用明文密码）
+    db_info = {
+        'name': db_name,
+        'host': host,
+        'port': port,
+        'database': database,
+        'user': user,
+        'password': password,  # 使用明文密码
+        'description': description,
+        'include_host_check': include_host_check
+    }
+    
+    # 合并SSH信息
+    db_info.update(ssh_info)
+    
+    # 测试连接
+    ConsolePrinter.print_info(f"正在验证连接 {host}:{port}/{database}...")
+    connector = PostgreSQLConnector(db_info, encryptor)
+    if connector.connect():
+        connector.close()
+        ConsolePrinter.print_success("数据库连接验证成功")
+        return db_info
+    else:
+        ConsolePrinter.print_error("数据库连接验证失败")
+        retry = input("🔄 是否重新输入? (y/n) [n]: ").strip().lower()
+        if retry == 'y':
+            return input_db_info(encryptor)
+        return None
+
+# 批量巡检菜单
+def batch_inspection_menu(license_manager, encryptor):
+    """批量巡检菜单"""
+    manager = BatchInspectionManager(license_manager, encryptor)
+    
+    while True:
+        ConsolePrinter.print_title("PostgreSQL批量巡检管理")
+        print("1. 🆕 生成Excel批量巡检模板")
+        print("2. 📋 查看可用模板")
+        print("3. 🔐 加密现有模板密码")
+        print("4. 🧪 测试模板连接")
+        print("5. 🚀 执行批量巡检")
+        print("6. 📄 查看许可证信息")
+        print("7. ↩️  返回主菜单")
+        
+        choice = input("\n请选择操作 [1-7]: ").strip()
+        
+        if choice == "1":
+            template_name = input("📝 输入Excel模板文件名 [回车使用默认名称]: ").strip()
+            template_path = manager.generate_excel_template(template_name if template_name else None)
+            if template_path:
+                ConsolePrinter.print_success("模板已生成")
+            
+        elif choice == "2":
+            manager.list_templates()
+            
+        elif choice == "3":
+            templates = manager.list_templates()
+            if not templates:
+                continue
+                
+            template_choice = input("🔐 选择要加密的模板文件 (输入序号或完整文件名): ").strip()
+            try:
+                if template_choice.isdigit():
+                    template_index = int(template_choice) - 1
+                    if 0 <= template_index < len(templates):
+                        template_path = os.path.join(manager.template_dir, templates[template_index])
+                    else:
+                        ConsolePrinter.print_error("无效的序号")
+                        continue
+                else:
+                    template_path = os.path.join(manager.template_dir, template_choice)
+                    if not os.path.exists(template_path):
+                        ConsolePrinter.print_error("模板文件不存在")
+                        continue
+                
+                if manager.encrypt_excel_passwords(template_path):
+                    ConsolePrinter.print_success("模板密码加密完成")
+                else:
+                    ConsolePrinter.print_error("模板密码加密失败")
+                
+            except Exception as e:
+                ConsolePrinter.print_error(f"加密模板失败: {e}")
+                
+        elif choice == "4":
+            # 新增：测试模板连接功能
+            templates = manager.list_templates()
+            if not templates:
+                continue
+                
+            template_choice = input("🧪 选择要测试的模板文件 (输入序号或完整文件名): ").strip()
+            try:
+                if template_choice.isdigit():
+                    template_index = int(template_choice) - 1
+                    if 0 <= template_index < len(templates):
+                        template_path = os.path.join(manager.template_dir, templates[template_index])
+                    else:
+                        ConsolePrinter.print_error("无效的序号")
+                        continue
+                else:
+                    template_path = os.path.join(manager.template_dir, template_choice)
+                    if not os.path.exists(template_path):
+                        ConsolePrinter.print_error("模板文件不存在")
+                        continue
+                
+                manager.test_template_connections(template_path)
+                
+            except Exception as e:
+                ConsolePrinter.print_error(f"测试模板连接失败: {e}")
+                
+        elif choice == "5":
+            # 检查许可证 - 使用修复后的方法
+            if not license_manager.check_license():
+                ConsolePrinter.print_error("许可证验证失败，无法执行批量巡检")
+                continue
+                
+            templates = manager.list_templates()
+            if not templates:
+                continue
+                
+            template_choice = input("📁 选择模板文件 (输入序号或完整文件名): ").strip()
+            try:
+                if template_choice.isdigit():
+                    template_index = int(template_choice) - 1
+                    if 0 <= template_index < len(templates):
+                        template_path = os.path.join(manager.template_dir, templates[template_index])
+                    else:
+                        ConsolePrinter.print_error("无效的序号")
+                        continue
+                else:
+                    template_path = os.path.join(manager.template_dir, template_choice)
+                    if not os.path.exists(template_path):
+                        ConsolePrinter.print_error("模板文件不存在")
+                        continue
+                
+                output_format = input("📊 输出格式 (1=Word, 2=Excel, 3=两者) [3]: ").strip()
+                if output_format == "1":
+                    output_format = "word"
+                elif output_format == "2":
+                    output_format = "excel"
+                else:
+                    output_format = "both"
+                
+                max_workers_input = input("⚡ 并发数量 [5]: ").strip()
+                max_workers = int(max_workers_input) if max_workers_input and max_workers_input.isdigit() else 5
+                
+                timeout_input = input("⏱️  超时时间(秒) [30]: ").strip()
+                timeout = int(timeout_input) if timeout_input and timeout_input.isdigit() else 30
+                
+                # 确认执行
+                confirm = input(f"🚀 即将检查数据库，确认执行? (y/n) [y]: ").strip().lower()
+                if confirm in ['', 'y', 'yes']:
+                    manager.run_batch_inspection(template_path, output_format, max_workers, timeout)
+                else:
+                    ConsolePrinter.print_info("已取消批量巡检")
+                
+            except Exception as e:
+                ConsolePrinter.print_error(f"执行批量巡检失败: {e}")
+                
+        elif choice == "6":
+            license_manager.show_license_info()
+                
+        elif choice == "7":
+            break
+            
+        else:
+            ConsolePrinter.print_error("无效选择")
+
+# 主程序
+def main():
+    """主程序"""
+    try:
+        # 初始化许可证管理器
+        license_manager = LicenseManager()
+        if not license_manager.init_license():
+            ConsolePrinter.print_error("许可证初始化失败，程序无法继续运行")
+            sys.exit(1)
+        
+        # 初始化密码加密器
+        encryptor = PasswordEncryptor()
+        
+        ConsolePrinter.print_title("PostgreSQL数据库健康检查工具 v3.0")
+        ConsolePrinter.print_info("功能: PostgreSQL数据库检查 + SSH远程主机检查")
+        ConsolePrinter.print_info("安全: 🔐 密码自动加密存储")
+        
+        while True:
+            print("\n🏠 主菜单:")
+            print("1. 🔍 单数据库检查")
+            print("2. 📊 批量巡检")
+            print("3. 📄 许可证信息")
+            print("4. 🔐 安全说明")
+            print("5. ❌ 退出程序")
+            
+            main_choice = input("\n请选择操作 [1-5]: ").strip()
+            
+            if main_choice == "1":
+                # 检查许可证 - 使用修复后的方法
+                if not license_manager.check_license():
+                    ConsolePrinter.print_error("许可证验证失败，无法执行检查")
+                    continue
+                    
+                # 单数据库检查
+                db_info = input_db_info(encryptor)
+                if not db_info:
+                    ConsolePrinter.print_error("数据库连接信息获取失败")
+                    continue
+                
+                # 连接数据库并执行检查
+                connector = PostgreSQLConnector(db_info, encryptor)
+                if not connector.connect():
+                    ConsolePrinter.print_error("数据库连接失败")
+                    continue
+                
+                include_host_check = db_info.get('include_host_check', True)
+                
+                # 提取SSH信息
+                ssh_info = {}
+                if include_host_check:
+                    ssh_info = {
+                        'ssh_user': db_info.get('ssh_user'),
+                        'ssh_password': db_info.get('ssh_password'),
+                        'ssh_port': db_info.get('ssh_port', 22)
+                    }
+                
+                # 修复：传入db_info参数
+                checker = PostgreSQLHealthChecker(connector, db_info)
+                results = checker.run_all_checks(
+                    include_host_check=include_host_check, 
+                    ssh_info=ssh_info
+                )
+                
+                connector.close()
+                
+                # 生成报告
+                ConsolePrinter.print_title("生成检查报告")
+                
+                report_type = input("📄 生成报告类型 (1=Word报告, 2=Excel报告, 3=两者都生成) [1]: ").strip()
+                
+                generator = PostgreSQLReportGenerator(db_info, results, encryptor)
+                report_paths = []
+                
+                if report_type in ["1", "3", ""]:
+                    word_path = generator.generate_word_report()
+                    if word_path:
+                        report_paths.append(word_path)
+                
+                if report_type in ["2", "3"]:
+                    excel_path = generator.generate_excel_report()
+                    if excel_path:
+                        report_paths.append(excel_path)
+                
+                # 结果汇总
+                ConsolePrinter.print_title("检查完成")
+                if report_paths:
+                    print("📁 生成的报告路径：")
+                    for path in report_paths:
+                        print(f"  📄 {path}")
+                    
+                    # 询问是否打开报告
+                    open_report = input("\n🔓 是否立即打开报告？(y/n) [n]: ").strip().lower()
+                    if open_report == 'y':
+                        for path in report_paths:
+                            try:
+                                if platform.system() == 'Windows':
+                                    os.startfile(path)
+                                elif platform.system() == 'Darwin':
+                                    subprocess.run(['open', path])
+                                else:
+                                    subprocess.run(['xdg-open', path])
+                                ConsolePrinter.print_success(f"正在打开: {path}")
+                            except Exception as e:
+                                ConsolePrinter.print_warning(f"打开报告失败: {e}")
+                else:
+                    ConsolePrinter.print_error("未生成任何报告")
+                
+                input("\n⏎ 按回车键继续...")
+                
+            elif main_choice == "2":
+                # 批量巡检
+                batch_inspection_menu(license_manager, encryptor)
+                
+            elif main_choice == "3":
+                # 显示许可证信息
+                license_manager.show_license_info()
+                input("\n⏎ 按回车键继续...")
+                
+            elif main_choice == "4":
+                # 显示安全说明
+                ConsolePrinter.print_title("安全说明")
+                print("🔐 密码安全特性:")
+                print("  ✅ 所有密码在存储时自动加密")
+                print("  ✅ 加密密钥基于机器特征生成")
+                print("  ✅ 模板文件不可跨机器使用")
+                print("  ✅ 报告中隐藏敏感密码信息")
+                print("  ✅ 支持加密现有模板文件")
+                print("\n⚠️  安全注意事项:")
+                print("  📍 请妥善保管模板文件")
+                print("  📍 建议定期更换数据库密码")
+                print("  📍 不要将模板分享给未授权人员")
+                print("  📍 使用后及时清理临时文件")
+                input("\n⏎ 按回车键继续...")
+                
+            elif main_choice == "5":
+                ConsolePrinter.print_success("感谢使用，再见！")
+                break
+                
+            else:
+                ConsolePrinter.print_error("无效选择")
+        
+    except KeyboardInterrupt:
+        ConsolePrinter.print_error("\n程序被用户中断")
+    except Exception as e:
+        ConsolePrinter.print_error(f"\n程序运行异常：{str(e)}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    # 检查Python版本
+    if sys.version_info < (3, 6):
+        print("❌ 本程序需要Python 3.6及以上版本")
+        sys.exit(1)
+    
+    # 检查必要库
+    missing_libs = []
+    try:
+        import psycopg2
+    except ImportError:
+        missing_libs.append("psycopg2")
+    
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError:
+        missing_libs.append("cryptography")
+    
+    if missing_libs:
+        ConsolePrinter.print_error(f"缺少必要的库: {', '.join(missing_libs)}")
+        sys.exit(1)
+    
+    # 启动主程序
+    main()
